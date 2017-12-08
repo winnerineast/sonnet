@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# =============================================================================
+# ============================================================================
+
 """Batch normalization module for Sonnet.
 
 This contains the module BatchNorm, which performs batch normalization on
@@ -22,11 +23,12 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+# Dependency imports
 from sonnet.python.modules import base
 from sonnet.python.modules import util
 import tensorflow as tf
 
-from tensorflow.contrib.layers.python.layers import utils
+from tensorflow.python.layers import utils
 from tensorflow.python.training import moving_averages
 
 
@@ -54,28 +56,31 @@ class BatchNorm(base.AbstractModule):
   """Batch normalization module, including optional affine transformation.
 
   This module maintains exponential moving averages of the mean and
-  variance, used for calculating more accurate shifted statistics at training
-  time and optionally used to normalize at test time.
-
-  In order to update the moving averages, the user must run the
-  ops in the tf.GraphKeys.UPDATE_OPS TensorFlow collection. For example:
-
-      bn = BatchNorm()
-      train_net = bn(train_inputs, is_training=True)
-      test_net = bn(test_inputs, is_training=False, test_local_stats=False)
-
-      ...
-
-      update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-      with tf.control_dependencies(update_ops):
-        train_op = tf.group(train_op)
-
-  Then, whenever `train_op` is run so also are the moving average update ops.
+  variance, which can be optionally used to normalize at test time.
 
   At training time, batch statistics (mean, variance) are not shared between
   separate connections. The moving averages are shared between separate
   connections. At both training and test time, the optional affine
-  transformations are shared between separate connections.
+  transformation (`* gamma + beta`) is shared between separate connections.
+
+  This is also the case for distributed replica training, where the batch
+  statistics are not aggregated across replicas, but the moving averages are
+  shared globally.
+
+  When connecting the module to the graph, `is_training=True` means that
+
+    - Update ops are created to update the moving averages with the current
+      batch's statistics.
+    - Features are normalized using the *current batch's statistics*. The
+      `test_local_stats` setting is ignored. The moving averages are
+      **not** used.
+
+  whereas `is_training=False` means that
+
+    - Update ops are not created.
+    - Features are normalized using either:
+      - The test batch statistics if `test_local_stats=True` (default).
+      - The moving averages if `test_local_stats=False`.
 
   Local batch statistics are used by default at test time, but the moving
   averages can be used by specifying a flag when connecting. One often wants
@@ -85,6 +90,41 @@ class BatchNorm(base.AbstractModule):
   to use moving average statistics, since it would make evaluation agnostic to
   the batch size, and might even lead to small improvements over the local
   batch statistics.
+
+  You can either update the moving averages automatically by setting
+  `update_ops_collection=None` or by running the ops in the given collection,
+  by default tf.GraphKeys.UPDATE_OPS.
+
+  For example, to run the updates automatically:
+
+      bn = BatchNorm(update_ops_collection=None)
+      train_net = bn(train_inputs, is_training=True)
+
+  this does, however, have the effect of blocking the forwards pass of the
+  network until the update ops have been run and may have a small performance
+  penalty.
+
+  For example, to run the updates manually:
+
+      bn = BatchNorm()
+      train_net = bn(train_inputs, is_training=True)
+
+      ...
+
+      update_ops = tf.group(*tf.get_collection(tf.GraphKeys.UPDATE_OPS))
+      train_op = tf.group(train_op, update_ops)
+
+  Then, whenever `train_op` is run so also are the moving average update ops.
+
+  Some batch normalization caveats:
+
+    - Batch normalization will remove the effect of adding a bias, so e.g.
+      `use_bias=False` should be used for an immediately preceding snt.Linear
+      module.
+    - If your data batches aren't i.i.d. then batch normalization can allow your
+      network to 'cheat' by using the batch statistics to peek at the rest of
+      the batch. This can exhibit itself as a higher test score with
+      `test_local_stats=True` than `test_local_stats=False`.
   """
 
   GAMMA = "gamma"
@@ -145,7 +185,7 @@ class BatchNorm(base.AbstractModule):
       TypeError: If any of the given initializers, partitioners or regularizers
         are not callable.
     """
-    super(BatchNorm, self).__init__(name)
+    super(BatchNorm, self).__init__(name=name)
 
     self._axis = axis
     self._offset = offset
@@ -304,7 +344,7 @@ class BatchNorm(base.AbstractModule):
       # Reduce over the second dimension.
       return "NCHW"
     else:
-      raise ValueError("Invalid axis option {:s}. This does not correspond to"
+      raise ValueError("Invalid axis option {}. This does not correspond to"
                        " either the NHWC format (0, 1, 2) or the NCHW "
                        "(0, 2, 3).".format(axis))
 
@@ -411,15 +451,14 @@ class BatchNorm(base.AbstractModule):
           regularizer=self._regularizers.get(self.GAMMA, None),
           trainable=self._scale)
 
-  def _build(self, input_batch, is_training=True, test_local_stats=True):
+  def _build(self, input_batch, is_training, test_local_stats=True):
     """Connects the BatchNorm module into the graph.
 
     Args:
       input_batch: A Tensor of arbitrary dimension. By default, the final
         dimension is not reduced over when computing the minibatch statistics.
       is_training: A boolean to indicate if the module should be connected in
-        training mode, meaning the moving averages are updated. By default
-        `True`. Can be a Tensor.
+        training mode, meaning the moving averages are updated. Can be a Tensor.
       test_local_stats: A boolean to indicate if local batch statistics should
         be used when `is_training=False`. If not, moving averages are used.
         By default `True`. Can be a Tensor.
@@ -437,25 +476,26 @@ class BatchNorm(base.AbstractModule):
     if self._axis is not None:
       if len(self._axis) > len(input_shape):
         raise base.IncompatibleShapeError(
-            "Too many indices specified in axis: len({:s}) > len({:s}).".format(
+            "Too many indices specified in axis: len({}) > len({}).".format(
                 self._axis, input_shape))
 
       if max(self._axis) >= len(input_shape):
         raise base.IncompatibleShapeError(
             "One or more index in axis is too large for "
-            "input shape: {:s} >= {:d}.".format(self._axis, len(input_shape)))
+            "input shape: {} >= {:d}.".format(self._axis, len(input_shape)))
 
       if min(self._axis) < 0:
         raise base.IncompatibleShapeError(
-            "Indices in axis must be non-negative: {:s} < 0.".format(
+            "Indices in axis must be non-negative: {} < 0.".format(
                 self._axis))
 
       axis = self._axis
     else:
       # Reduce over all dimensions except the last.
-      axis = range(len(input_shape))[:-1]
+      axis = tuple(range(len(input_shape))[:-1])
 
     # See following for important note on accuracy for dtype=tf.float16
+    # https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/ops/nn_impl.py#L63
     dtype = input_batch.dtype
     if dtype == tf.float16:
       raise base.NotSupportedError(

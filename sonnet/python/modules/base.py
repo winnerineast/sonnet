@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# =============================================================================
+# ============================================================================
+
 """Base class for TensorFlow snt.
 
 This file contains the Abstract Base Class for defining Modules in TensorFlow.
@@ -24,59 +25,28 @@ from __future__ import division
 from __future__ import print_function
 
 import abc
-import types
+import collections
+import inspect
+
+# Dependency imports
 import six
+from sonnet.python.modules import base_info
 from sonnet.python.modules import util
 import tensorflow as tf
 
-from tensorflow.python.util.deprecation import deprecated
+# Import error class from base_errors for backward compability.
 
-
-class Error(Exception):
-  """Base class for all errors from snt.
-
-  This is thrown to indicate a Neural Network specific problem, e.g. wrong
-  module arity, module is not connected to the graph when it should be,
-  tried to wire together incompatible modules, etc.
-  """
-
-
-class NotConnectedError(Error):
-  """Error raised when operating on a module that has not yet been connected.
-
-  Some module properties / methods are valid to access before the module has
-  been connected into the graph, but some are not. This Error is raised when
-  the user attempts to do anything not valid before connection.
-  """
-
-
-class ParentNotBuiltError(Error):
-  """Error raised when the parent of a module has not been built yet.
-
-  For example, when making a transpose of modules that inherit from
-  `module.Transposable`, the parent has to be connected to the graph before the
-  child transpose to ensure that shape inference has already occurred.
-  """
-
-
-class IncompatibleShapeError(Error):
-  """Error raised when the shape of the input at build time is incompatible."""
-
-
-class UnderspecifiedError(Error):
-  """Error raised when too little information is available.
-
-  This does not typically mean the user is trying to do something that doesn't
-  work (in which case `IncompatibleShapeError` should be used), just that
-  some more information needs to be provided in order to build the Graph.
-  """
-
-
-class NotSupportedError(Error):
-  """Error raised when something that cannot be supported is requested.
-
-  For example a Dilated Convolution module cannot be transposed.
-  """
+from sonnet.python.modules.base_errors import Error
+from sonnet.python.modules.base_errors import NotConnectedError
+from sonnet.python.modules.base_errors import ParentNotBuiltError
+from sonnet.python.modules.base_errors import IncompatibleShapeError
+from sonnet.python.modules.base_errors import UnderspecifiedError
+from sonnet.python.modules.base_errors import NotSupportedError
+from sonnet.python.modules.base_errors import NotInitializedError
+from sonnet.python.modules.base_errors import DifferentGraphError
+from sonnet.python.modules.base_errors import ModuleInfoError
+# pylint: enable=g-bad-import-order
+# pylint: enable=unused-import
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -99,26 +69,59 @@ class AbstractModule(object):
   sharing will not work.
   """
 
-  def __init__(self, name):
+  def __init__(self, _sentinel=None, custom_getter=None,
+               name=None):  # pylint: disable=invalid-name
     """Performs the initialisation necessary for all AbstractModule instances.
 
     Every subclass of AbstractModule must begin their constructor with a call to
     this constructor, i.e. `super(MySubModule, self).__init__(name=name)`.
 
-    Avoid instantiating sub-modules in __init__ where possible, as they will not
-    be defined under the module's scope. Instead, instantiate sub-modules in
-    `build`.
+    If you instantiate sub-modules in __init__ you must create them within the
+    `_enter_variable_scope` context manager to ensure they are in the module's
+    variable scope. Alternatively, instantiate sub-modules in `_build`.
 
     Args:
+      _sentinel: Variable that only carries a non-None value if `__init__` was
+          called without named parameters. If this is the case, a deprecation
+          warning is issued in form of a `ValueError`.
+      custom_getter: Callable or dictionary of callables to use as
+        custom getters inside the module. If a dictionary, the keys
+        correspond to regexes to match variable names. See the `tf.get_variable`
+        documentation for information about the custom_getter API.
       name: Name of this module. Used to construct the Templated build function.
+          If `None` the module's class name is used (converted to snake case).
 
     Raises:
-      ValueError: If name is not specified.
+      TypeError: If `name` is not a string.
+      TypeError: If a given `custom_getter` is not callable.
+      ValueError: If `__init__` was called without named arguments.
     """
-    if not isinstance(name, types.StringTypes):
-      raise ValueError("Name must be a string.")
-    self._is_connected = False
-    self._template = tf.make_template(name, self._build, create_scope_now_=True)
+    if _sentinel is not None:
+      raise ValueError("Calling AbstractModule.__init__ without named "
+                       "arguments is deprecated.")
+
+    if name is None:
+      name = util.to_snake_case(self.__class__.__name__)
+    elif not isinstance(name, six.string_types):
+      raise TypeError("Name must be a string.")
+
+    self._connected_subgraphs = []
+
+    # If the given custom getter is a dictionary with a per-variable custom
+    # getter, wrap it into a single custom getter.
+    if isinstance(custom_getter, collections.Mapping):
+      self._custom_getter = util.custom_getter_router(
+          custom_getter_map=custom_getter,
+          name_fn=lambda name: name[len(self.scope_name) + 1:])
+    else:
+      if not (custom_getter is None or callable(custom_getter)):
+        raise TypeError("Given custom_getter is not callable.")
+      self._custom_getter = custom_getter
+
+    self._template = tf.make_template(name,
+                                      self._build_wrapper,
+                                      create_scope_now_=True,
+                                      custom_getter_=self._custom_getter)
 
     self._original_name = name
     self._unique_name = self._template.variable_scope.name.split("/")[-1]
@@ -126,6 +129,80 @@ class AbstractModule(object):
     # Update __call__ and the object docstrings to enable better introspection
     self.__doc__ = self._build.__doc__
     self.__call__.__func__.__doc__ = self._build.__doc__
+
+    # Keep track of which graph this module has been connected to. Sonnet
+    # modules cannot be connected to multiple graphs, as transparent variable
+    # sharing is impossible in that case.
+    self._graph = None
+
+  def _build_wrapper(self, *args, **kwargs):
+    """Function which will be wrapped in a Template to do variable sharing.
+
+    Passes through all arguments to the _build method, and returns the
+    corresponding outputs, plus the name_scope generated by this call of the
+    template.
+
+    Args:
+      *args: args list for self._build
+      **kwargs: kwargs dict for self._build
+
+    Returns:
+      A tuple containing (output from _build, scope_name).
+    """
+    output = self._build(*args, **kwargs)
+    # Make a dummy subscope to check the name scope we are in. We could read
+    # the name scope from one of the outputs produced, except that the outputs
+    # could have been produced from a subscope instantiated by the build
+    # function, for example if inner modules are present. Calling name_scope
+    # here and creating a new subscope guarantees we get the right answer.
+    # Because we don't create an ops inside this dummy scope, no extra memory
+    # will be consumed.
+    with tf.name_scope("dummy") as scope_name:
+      this_scope_name = scope_name[:-len("/dummy/")]
+    return output, this_scope_name
+
+  def _check_init_called(self):
+    """Checks that the base class's __init__ method has been called.
+
+    Raises:
+      NotInitializedError: `AbstractModule.__init__` has not been called.
+    """
+    try:
+      self._template
+    except AttributeError:
+      raise NotInitializedError("You may have forgotten to call super at the "
+                                "start of %s.__init__."
+                                % self.__class__.__name__)
+
+  def _set_module_info(self):
+    """Creates a `ModuleInfo` and adds it to the graph collections."""
+    self._module_info = base_info.ModuleInfo(
+        module_name=self.module_name,
+        scope_name=self.scope_name,
+        class_name="{}.{}".format(
+            self.__class__.__module__, self.__class__.__name__),
+        connected_subgraphs=self._connected_subgraphs)
+    self._graph.add_to_collection(base_info.SONNET_COLLECTION_NAME,
+                                  self._module_info)
+
+  def _check_same_graph(self):
+    """Checks that the module is not being connect to multiple Graphs.
+
+    An instance of a Sonnet module 'owns' the variables it contains, and permits
+    seamless variable sharing. As such, connecting a single module instance to
+    multiple Graphs is not possible - this function will raise an error should
+    that occur.
+
+    Raises:
+      DifferentGraphError: if the module is connected to a different Graph than
+        it was previously used in.
+    """
+    current_graph = tf.get_default_graph()
+    if self._graph is None:
+      self._graph = current_graph
+      self._set_module_info()
+    elif self._graph != current_graph:
+      raise DifferentGraphError("Cannot connect module to multiple Graphs.")
 
   @abc.abstractmethod
   def _build(self, *args, **kwargs):
@@ -140,13 +217,59 @@ class AbstractModule(object):
     Returns:
       output Tensor(s).
     """
-    pass
+
+  def _add_connected_subgraph(self, call_method, outputs, subgraph_name_scope,
+                              *inputs_args, **inputs_kwargs):
+    """Adds a newly connected subgraph.
+
+    Args:
+      call_method: the function used to connect this Sonnet module to the graph.
+      outputs: `call_method` outputs.
+      subgraph_name_scope: name scope of the newly connected subgraph.
+      *inputs_args: `self._build` inputs `*args`.
+      **inputs_kwargs: `self._build` inputs `*kwargs`.
+    """
+    build_inputs = inspect.getcallargs(call_method,
+                                       *inputs_args, **inputs_kwargs)
+
+    # "self" should normally be in `build_inputs` but some people are decorating
+    # their `_build` function with `memoize`, in which case the function
+    # signature doesn't contain `self` anymore.
+
+    if "self" in build_inputs:
+      del build_inputs["self"]
+
+    connected_subgraph = base_info.ConnectedSubGraph(
+        module=self, name_scope=subgraph_name_scope,
+        inputs=build_inputs,
+        outputs=outputs)
+    self._connected_subgraphs.append(connected_subgraph)
 
   def __call__(self, *args, **kwargs):
-    out = self._template(*args, **kwargs)
-    # Connect the module only if self._template returns with no errors.
-    self._is_connected = True
-    return out
+    """Operator overload for calling.
+
+    This is the entry point when users connect a Module into the Graph. The
+    underlying _build method will have been wrapped in a Template by the
+    constructor, and we call this template with the provided inputs here.
+
+    Args:
+      *args: Arguments for underlying _build method.
+      **kwargs: Keyword arguments for underlying _build method.
+
+    Returns:
+      The result of the underlying _build method.
+    """
+    self._check_init_called()
+    self._check_same_graph()
+    outputs, subgraph_name_scope = self._template(*args, **kwargs)
+    self._add_connected_subgraph(self._build, outputs, subgraph_name_scope,
+                                 *args, **kwargs)
+    return outputs
+
+  @property
+  def name_scopes(self):
+    """Returns a tuple of all name_scopes generated by this module."""
+    return tuple(subgraph.name_scope for subgraph in self._connected_subgraphs)
 
   @property
   def variable_scope(self):
@@ -170,31 +293,6 @@ class AbstractModule(object):
     return self._template.variable_scope
 
   @property
-  @deprecated(
-      "2017-02-21", "The .var_scope property is deprecated. Please change your "
-      "code to use the .variable_scope property")
-  def var_scope(self):
-    """Returns the variable_scope declared by the module.
-
-    Deprecated in favour of `.variable_scope`.
-
-    Returns:
-      variable_scope: `tf.VariableScope` instance of the internal `tf.Template`.
-
-    Raises:
-      NotConnectedError: If the module is not connected to the Graph.
-    """
-    return self.variable_scope
-
-  @property
-  @deprecated(
-      "2017-03-01", "The .name property is deprecated. Please change your "
-      "code to use the .scope_name or .module_name property as appropriate")
-  def name(self):
-    """Returns the full name of the Module's variable scope."""
-    return self.scope_name
-
-  @property
   def scope_name(self):
     """Returns the full name of the Module's variable scope."""
     return self._template.variable_scope.name
@@ -207,7 +305,25 @@ class AbstractModule(object):
   @property
   def is_connected(self):
     """Returns true iff the Module been connected to the Graph at least once."""
-    return self._is_connected
+    return bool(self._connected_subgraphs)
+
+  @property
+  def connected_subgraphs(self):
+    """Returns the subgraphs created by this module so far."""
+    return tuple(self._connected_subgraphs)
+
+  @property
+  def last_connected_subgraph(self):
+    """Returns the last subgraph created by this module.
+
+    Returns:
+      The last connected subgraph.
+
+    Raises:
+      NotConnectedError: If the module is not connected to the Graph.
+    """
+    self._ensure_is_connected()
+    return self._connected_subgraphs[-1]
 
   @classmethod
   def get_possible_initializer_keys(cls):
@@ -278,6 +394,8 @@ class AbstractModule(object):
     Returns:
       `contextlib.contextmanager` of the variable_scope inside the template.
     """
+    self._check_init_called()
+    self._check_same_graph()
     return tf.variable_scope(self._template.variable_scope, reuse=reuse)
 
   def get_variables(self, collection=tf.GraphKeys.TRAINABLE_VARIABLES):
@@ -300,6 +418,12 @@ class AbstractModule(object):
     """
     return util.get_variables_in_scope(
         self.variable_scope, collection=collection)
+
+  def __getstate__(self):
+    raise NotSupportedError(
+        "Sonnet AbstractModule instances cannot be serialized. You should "
+        "instead serialize all necessary configuration which will allow "
+        "modules to be rebuilt.")
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -342,18 +466,16 @@ class Transposable(object):
     Returns:
       Transposed version of the module.
     """
-    pass
 
   @abc.abstractmethod
   def input_shape(self):
     """Returns shape of input `Tensor` passed at last call to `build`."""
-    pass
 
 
 class Module(AbstractModule):
   """Module wrapping a function provided by the user."""
 
-  def __init__(self, build, name="module"):
+  def __init__(self, build, custom_getter=None, name=None):
     """Constructs a module with a given build function.
 
     The Module class can be used to wrap a function assembling a network into a
@@ -400,15 +522,24 @@ class Module(AbstractModule):
           The `build` function signature can include the following parameters:
             *args - Input Tensors.
             **kwargs - Additional Python parameters controlling connection.
-      name: Module name.
+      custom_getter: Callable or dictionary of callables to use as
+          custom getters inside the module. If a dictionary, the keys
+          correspond to regexes to match variable names. See the
+          `tf.get_variable` documentation for information about the
+          custom_getter API.
+      name: Module name. If set to `None` (the default), the name will be set to
+          that of the `build` callable converted to `snake_case`. If `build` has
+          no name, the name will be 'module'.
 
     Raises:
       TypeError: If build is not callable.
+      TypeError: If a given `custom_getter` is not callable.
     """
-    super(Module, self).__init__(name)
-
     if not callable(build):
       raise TypeError("Input 'build' must be callable.")
+    if name is None:
+      name = util.name_for_callable(build)
+    super(Module, self).__init__(custom_getter=custom_getter, name=name)
     self._build_function = build
 
   def _build(self, *args, **kwargs):

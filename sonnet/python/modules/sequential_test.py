@@ -11,12 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# =============================================================================
+# ============================================================================
+
 """Tests for sonnet.python.modules.nn."""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+# Dependency imports
+import mock
+import six
 import sonnet as snt
 import tensorflow as tf
 
@@ -58,7 +62,10 @@ class SequentialTest(tf.test.TestCase):
     def module2(a, b, c):
       return a, b, c
 
-    err_str = r"module2\(\) takes exactly 3 arguments \(2 given\)"
+    if six.PY3:
+      err_str = r"module2\(\) missing 1 required positional argument: 'c'"
+    else:
+      err_str = r"module2\(\) takes exactly 3 arguments \(2 given\)"
     with self.assertRaisesRegexp(TypeError, err_str):
       _, _ = snt.Sequential([module1, module2], name="seq2")(1, 2)
 
@@ -77,6 +84,26 @@ class SequentialTest(tf.test.TestCase):
     with self.assertRaisesRegexp(TypeError,
                                  "'NoneType' object is not iterable"):
       snt.Sequential(None)
+
+  def testNameScopeRecording(self):
+    lin = snt.Linear(output_size=256)
+    sequential = snt.Sequential([lin])
+
+    with tf.name_scope("blah"):
+      sequential(tf.placeholder(dtype=tf.float32, shape=[2, 3]))
+    self.assertEqual(sequential.name_scopes, ("blah/sequential",))
+    self.assertEqual(lin.name_scopes, ("blah/sequential/linear",))
+
+  def testWarning(self):
+    seq = snt.Sequential([snt.Linear(output_size=23),
+                          snt.Linear(output_size=42)])
+    seq(tf.placeholder(dtype=tf.float32, shape=[2, 3]))
+    with mock.patch.object(tf.logging, "warning") as mocked_logging_warning:
+      self.assertEqual((), seq.get_variables())
+      self.assertTrue(mocked_logging_warning.called)
+
+      first_call_args = mocked_logging_warning.call_args[0]
+      self.assertTrue("will always return an empty tuple" in first_call_args[0])
 
 
 if __name__ == "__main__":

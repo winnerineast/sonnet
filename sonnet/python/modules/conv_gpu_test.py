@@ -11,19 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# =============================================================================
+# ============================================================================
+
+"""Tests for `sonnet.python.modules.conv`."""
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
 import functools
-import unittest
-from nose_parameterized import parameterized
 
+# Dependency imports
+from absl.testing import parameterized
 import numpy as np
 import sonnet as snt
 import tensorflow as tf
+
 from tensorflow.python.platform import test
 
 
@@ -34,14 +37,17 @@ def create_constant_initializers(w, b, use_bias=True):
     return {"w": tf.constant_initializer(w)}
 
 
-@unittest.skipUnless(test.is_gpu_available(),
-                     "Test only applicable when running on GPUs")
-class ConvTestDataFormats(tf.test.TestCase):
+class ConvTestDataFormats(parameterized.TestCase, tf.test.TestCase):
   OUT_CHANNELS = 5
   KERNEL_SHAPE = 3
   INPUT_SHAPE = (2, 19, 19, 4)
 
-  def helperDataFormats(self, func, x, use_bias):
+  def setUp(self):
+    name = "{}.{}".format(type(self).__name__, self._testMethodName)
+    if not test.is_gpu_available():
+      self.skipTest("No GPU was detected, so {} will be skipped.".format(name))
+
+  def helperDataFormats(self, func, x, atol=1e-5):
     """Test whether the result for different Data Formats is the same."""
     mod1 = func(name="default")
     mod2 = func(name="NCHW_conv", data_format="NCHW")
@@ -50,24 +56,27 @@ class ConvTestDataFormats(tf.test.TestCase):
     o2 = tf.transpose(mod2(x_transpose), perm=(0, 2, 3, 1))
     with self.test_session(use_gpu=True, force_gpu=True):
       tf.global_variables_initializer().run()
-      self.assertAllClose(o1.eval(), o2.eval())
+      self.assertAllClose(o1.eval(), o2.eval(), atol=atol)
 
-  @parameterized.expand([("WithBias", True), ("WithoutBias", False)])
-  def testConv2DDataFormats(self, _, use_bias):
-
+  @parameterized.named_parameters(
+      ("WithBias_Stride1", True, 1), ("WithoutBias_Stride1", False, 1),
+      ("WithBias_Stride2", True, 2), ("WithoutBias_Stride2", False, 2))
+  def testConv2DDataFormats(self, use_bias, stride):
     """Test data formats for Conv2D."""
     func = functools.partial(
         snt.Conv2D,
         output_channels=self.OUT_CHANNELS,
         kernel_shape=self.KERNEL_SHAPE,
         use_bias=use_bias,
+        stride=stride,
         initializers=create_constant_initializers(1.0, 1.0, use_bias))
     x = tf.constant(np.random.random(self.INPUT_SHAPE).astype(np.float32))
-    self.helperDataFormats(func, x, use_bias)
+    self.helperDataFormats(func, x)
 
-  @parameterized.expand([("WithBias", True), ("WithoutBias", False)])
-  def testConv2DTransposeDataFormats(self, _, use_bias):
-
+  @parameterized.named_parameters(
+      ("WithBias_Stride1", True, 1), ("WithoutBias_Stride1", False, 1),
+      ("WithBias_Stride2", True, 2), ("WithoutBias_Stride2", False, 2))
+  def testConv2DTransposeDataFormats(self, use_bias, stride):
     """Test data formats for Conv2DTranspose."""
 
     mb, h, w, c = self.INPUT_SHAPE
@@ -80,18 +89,18 @@ class ConvTestDataFormats(tf.test.TestCase):
           output_channels=self.OUT_CHANNELS,
           kernel_shape=self.KERNEL_SHAPE,
           use_bias=use_bias,
+          stride=stride,
           initializers=create_constant_initializers(1.0, 1.0, use_bias),
           data_format=data_format)
       _ = mod(temp_input)
       return mod.transpose(name=name + "Trans")
 
-    shape = (mb, h, w, self.OUT_CHANNELS)
+    shape = (mb, np.ceil(h / stride), np.ceil(w / stride), self.OUT_CHANNELS)
     x = tf.constant(np.random.random(shape).astype(np.float32))
-    self.helperDataFormats(func, x, use_bias)
+    self.helperDataFormats(func, x)
 
-  @parameterized.expand([("WithBias", True), ("WithoutBias", False)])
-  def testConv2DDataFormatsBatchNorm(self, _, use_bias):
-
+  @parameterized.named_parameters(("WithBias", True), ("WithoutBias", False))
+  def testConv2DDataFormatsBatchNorm(self, use_bias):
     """Tests data formats for the convolutions with batch normalization."""
 
     def func(name, data_format="NHWC"):
@@ -107,9 +116,9 @@ class ConvTestDataFormats(tf.test.TestCase):
       else:
         bn = snt.BatchNorm(scale=True, update_ops_collection=None, fused=True,
                            axis=(0, 2, 3))
-      return snt.Sequential([conv, bn])
+      return snt.Sequential([conv, functools.partial(bn, is_training=True)])
     x = tf.constant(np.random.random(self.INPUT_SHAPE).astype(np.float32))
-    self.helperDataFormats(func, x, use_bias)
+    self.helperDataFormats(func, x)
 
 
 if __name__ == "__main__":
